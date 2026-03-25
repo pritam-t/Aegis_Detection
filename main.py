@@ -1,5 +1,4 @@
 
-
 import cv2
 import numpy as np
 import pytesseract
@@ -13,15 +12,17 @@ from datetime import datetime
 # CONFIG
 # ──────────────────────────────────────────────
 MODEL_PATH      = "best.pt"
-INPUT_VIDEO     = "test.mp4"
+INPUT_VIDEO     = "test2.mp4"
 REPORT_PATH     = "aegis_report.json"
 PLATES_DIR      = "aegis_plates"
 
 TESSERACT_PATH  = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
-HELMET_OFF_CONF = 0.50   # Min confidence to consider helmet is OFF
-PLATE_CONF_MIN  = 0.80   # Plate must be >= 80% confident to process
-MIN_PLATE_CHARS = 4      # OCR result must have at least this many chars to save
+HELMET_OFF_CONF = 0.50   # Min confidence to flag helmet-off
+PLATE_CONF_MIN  = 0.60   # Min plate confidence to attempt OCR
+                         # NOTE: This model outputs plate conf in 0.60-0.75 range.
+                         #       Raise to 0.70+ once you retrain on more data.
+MIN_PLATE_CHARS = 4      # OCR must return at least this many chars to count
 
 
 # ──────────────────────────────────────────────
@@ -30,11 +31,15 @@ MIN_PLATE_CHARS = 4      # OCR result must have at least this many chars to save
 def read_plate(crop):
     """Preprocess and OCR a plate crop. Returns cleaned alphanumeric string."""
     h, w = crop.shape[:2]
-    scale = max(2, int(150 / max(h, 1)))
+    if h == 0 or w == 0:
+        return ""
+
+    # Upscale so Tesseract has enough pixels
+    scale = max(2, int(150 / h))
     crop  = cv2.resize(crop, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
 
-    gray  = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    blur  = cv2.GaussianBlur(gray, (3, 3), 0)
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
 
     _, otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     adapt   = cv2.adaptiveThreshold(blur, 255,
@@ -72,6 +77,7 @@ def run():
     print(f"[AEGIS] Loading model : {MODEL_PATH}")
     model = YOLO(MODEL_PATH)
     names = model.names
+    print(f"[AEGIS] Classes       : {names}")
 
     cap = cv2.VideoCapture(INPUT_VIDEO)
     if not cap.isOpened():
@@ -79,10 +85,13 @@ def run():
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps          = cap.get(cv2.CAP_PROP_FPS) or 30
-    print(f"[AEGIS] {int(cap.get(3))}x{int(cap.get(4))} @ {fps:.0f}fps | {total_frames} frames")
+    print(f"[AEGIS] Video         : {int(cap.get(3))}x{int(cap.get(4))} "
+          f"@ {fps:.0f}fps | {total_frames} frames")
+    print(f"[AEGIS] Thresholds    : helmet-off >= {HELMET_OFF_CONF:.0%} | "
+          f"plate >= {PLATE_CONF_MIN:.0%}")
     print("-" * 55)
 
-    saved_plates = set()   # plate texts already saved — prevents duplicates
+    saved_plates = set()   # plates already saved — dedup
     violations   = []
     frame_no     = 0
     t_start      = time.time()
@@ -96,7 +105,7 @@ def run():
         results = model(frame, verbose=False)[0]
 
         helmet_off = False
-        best_plate = None   # (x1,y1,x2,y2, conf)
+        best_plate = None   # (x1,y1,x2,y2, conf) — highest conf plate this frame
 
         for box in results.boxes:
             cls   = int(box.cls[0])
@@ -111,13 +120,13 @@ def run():
                 if best_plate is None or conf > best_plate[4]:
                     best_plate = (x1, y1, x2, y2, conf)
 
-        # Step 2: helmet worn → skip
+        # Helmet worn (or no rider) → nothing to do
         if not helmet_off:
             if frame_no % 100 == 0:
                 _progress(frame_no, total_frames, t_start)
             continue
 
-        # Step 3: no plate found → skip
+        # Helmet off but no plate found → skip
         if best_plate is None:
             if frame_no % 100 == 0:
                 _progress(frame_no, total_frames, t_start)
@@ -125,22 +134,23 @@ def run():
 
         px1, py1, px2, py2, p_conf = best_plate
 
-        # Step 4: plate confidence < 80% → skip
+        # Plate confidence below threshold → skip
         if p_conf < PLATE_CONF_MIN:
             if frame_no % 100 == 0:
                 _progress(frame_no, total_frames, t_start)
             continue
 
-        # OCR
+        # OCR the plate
         plate_crop = frame[py1:py2, px1:px2]
         plate_text = read_plate(plate_crop)
 
+        # OCR returned too little → skip (plate not readable yet)
         if len(plate_text) < MIN_PLATE_CHARS:
             if frame_no % 100 == 0:
                 _progress(frame_no, total_frames, t_start)
             continue
 
-        # Step 5: already saved this plate → skip
+        # Already saved this plate → skip
         if plate_text in saved_plates:
             if frame_no % 100 == 0:
                 _progress(frame_no, total_frames, t_start)
@@ -148,7 +158,8 @@ def run():
 
         # ── New unique violation — save it ───────
         saved_plates.add(plate_text)
-        img_path = os.path.join(PLATES_DIR, f"plate_{len(violations)+1:03d}_{plate_text}.jpg")
+        img_path = os.path.join(PLATES_DIR,
+                                f"plate_{len(violations)+1:03d}_{plate_text}.jpg")
         cv2.imwrite(img_path, plate_crop)
 
         record = {
@@ -170,6 +181,7 @@ def run():
 
     cap.release()
 
+    # Save report
     report = {
         "run_time":         datetime.now().isoformat(),
         "model":            MODEL_PATH,
