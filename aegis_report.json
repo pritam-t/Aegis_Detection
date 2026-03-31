@@ -1,0 +1,19 @@
+{
+  "run_time": "2026-03-31T09:53:07.109378",
+  "model": "best.pt",
+  "input_video": "resources/test5.mp4",
+  "ocr_engine": "easyocr",
+  "plate_format": "XX YY X{1-3} YYYY",
+  "total_frames": 464,
+  "frames_processed": 464,
+  "frame_skip": 1,
+  "avg_fps_processed": 1.7,
+  "elapsed_seconds": 270.5,
+  "hardware": "CPU",
+  "fp16": false,
+  "tracker": "ByteTrack",
+  "noise_discarded": 15,
+  "hard_negatives": 1,
+  "total_violations": 0,
+  "violations": []
+}

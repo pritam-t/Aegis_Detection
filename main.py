@@ -12,7 +12,7 @@ from datetime import datetime
 # CONFIG
 # ──────────────────────────────────────────────
 MODEL_PATH      = "best.pt"
-INPUT_VIDEO     = "test2.mp4"
+INPUT_VIDEO     = r"resources\test5.mp4"
 REPORT_PATH     = "aegis_report.json"
 PLATES_DIR      = "aegis_plates"
 
