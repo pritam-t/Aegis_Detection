@@ -23,8 +23,8 @@ load_dotenv()
 # ──────────────────────────────────────────────
 # CONFIG--updated
 # ──────────────────────────────────────────────
-MODEL_PATH      = "best.pt"
-INPUT_VIDEO     = r"resources\test3.mp4"
+MODEL_PATH      = "bestv8.pt"
+INPUT_VIDEO     = r"resources\test5.mp4"
 REPORT_PATH     = "aegis_report.json"
 PLATES_DIR      = "aegis_plates"
 

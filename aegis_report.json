@@ -1,24 +1,24 @@
 {
-  "run_time": "2026-04-08T22:31:27.480334+05:30",
-  "model": "best.pt",
+  "run_time": "2026-04-10T00:01:44.463874+05:30",
+  "model": "bestv8.pt",
   "input_video": "resources\\test3.mp4",
   "location": "Sector 19, Nerul, Navi Mumbai, Maharashtra 400706, India",
-  "total_frames": 697,
-  "noise_discarded": 12,
+  "total_frames": 698,
+  "noise_discarded": 13,
   "total_violations": 1,
   "violations": [
     {
-      "frame": 43,
-      "timestamp_sec": 0.72,
-      "plate_text": "MH03EU7565",
-      "plate_conf": 0.6281,
-      "plate_image": "aegis_plates\\plate_MH03EU7565.jpg",
-      "frame_image": "aegis_plates\\frame_MH03EU7565.jpg",
+      "frame": 135,
+      "timestamp_sec": 2.25,
+      "plate_text": "MH03EU7569",
+      "plate_conf": 0.6094,
+      "plate_image": "aegis_plates\\plate_MH03EU7569.jpg",
+      "frame_image": "aegis_plates\\frame_MH03EU7569.jpg",
       "violation_no": 1,
-      "plate_url": "https://onsbxjfexnewuuuhtcve.supabase.co/storage/v1/object/public/number_plate/plate_MH03EU7565.jpg",
-      "frame_url": "https://onsbxjfexnewuuuhtcve.supabase.co/storage/v1/object/public/violation_image/frame_MH03EU7565.jpg",
-      "supabase_row_id": "5b06294d-c4ef-420e-8492-ed10f6c50114",
-      "pushed_at": "2026-04-08T22:31:19.750388+05:30"
+      "plate_url": "",
+      "frame_url": "",
+      "supabase_row_id": "",
+      "pushed_at": ""
     }
   ]
 }
