@@ -6,6 +6,7 @@ import json
 import time
 import uuid
 import hashlib
+import shutil
 import threading
 import queue
 from datetime import datetime, timezone, timedelta
@@ -48,29 +49,27 @@ IST             = timezone(timedelta(hours=5, minutes=30))
 # ──────────────────────────────────────────────
 _GPU_AVAILABLE  = torch.cuda.is_available()
 
-FRAME_QUEUE_SIZE  = 128       # decoded frames buffered ahead of GPU
-INFERENCE_BATCH   = 12        # safe for 4 GB VRAM @ 640px FP16
-INFER_IMG_SIZE    = 640       # full resolution — 3050 handles it
-USE_FP16          = True      # ~2× faster; requires CUDA 12 + matching cuDNN
+FRAME_QUEUE_SIZE  = 128
+INFERENCE_BATCH   = 12
+INFER_IMG_SIZE    = 640
+USE_FP16          = True      # FIX: managed as a module-level variable, not mutated via globals()
 
-OCR_WORKERS       = 2         # PaddleOCR workers — GPU not bottleneck anymore
+OCR_WORKERS       = 2
 OCR_QUEUE_SIZE    = 512
 
-FRAME_SKIP        = 0         # process EVERY frame — GPU is fast enough
+FRAME_SKIP        = 0
 
-# How many frames to keep tracking a helmet-off rider looking for a plate
-PENDING_TTL_FRAMES = 90       # ~3 s at 30 fps
+PENDING_TTL_FRAMES = 90
 
-_SENTINEL = None
+# FIX: Use a dedicated sentinel object instead of None to avoid false matches
+# with legitimate None values (e.g. a failed frame read).
+_SENTINEL = object()
 
 
 # ──────────────────────────────────────────────
 # FAST VIDEO CAPTURE
 # ──────────────────────────────────────────────
 class FastCapture:
-    """
-    Background-thread video decoder so the GPU worker never stalls on disk I/O.
-    """
     def __init__(self, path: str, queue_size: int = 256):
         self._cap    = cv2.VideoCapture(path)
         self._q      = queue.Queue(maxsize=queue_size)
@@ -87,7 +86,7 @@ class FastCapture:
             try:
                 self._q.put(frame, timeout=0.5)
             except queue.Full:
-                pass   # drop frame if consumer is too slow — keeps memory bounded
+                pass
 
     def read(self):
         frame = self._q.get()
@@ -144,7 +143,6 @@ def iou(boxA, boxB) -> float:
 
 
 def find_overlapping_box(target_box, box_dict: dict, threshold: float = 0.35):
-    """Return the key in box_dict whose box overlaps target_box above threshold."""
     best_key, best_iou = None, threshold
     for key in box_dict:
         ov = iou(target_box, key)
@@ -175,7 +173,7 @@ def correct_plate(text: str) -> str:
     return "".join(corrected)
 
 
-# ── Plate OCR — one PaddleOCR instance per thread, crop-level cache ──────────
+# ── Plate OCR ────────────────────────────────────────────────────────────────
 _ocr_cache: dict      = {}
 _cache_lock           = threading.Lock()
 _ocr_engine_tls       = threading.local()
@@ -183,10 +181,13 @@ _ocr_engine_tls       = threading.local()
 
 def _get_ocr_engine() -> PaddleOCR:
     if not hasattr(_ocr_engine_tls, "engine"):
+        # FIX: `use_textline_orientation` was removed in PaddleOCR >= 2.7 (which
+        # supports Python 3.12). Use `use_angle_cls` instead, which is the correct
+        # equivalent parameter name across all supported versions.
         _ocr_engine_tls.engine = PaddleOCR(
-            use_textline_orientation=False,
+            use_angle_cls=False,
             lang="en",
-            use_gpu= False,   # GPU OCR now that cuDNN is fixed
+            use_gpu=False,
         )
     return _ocr_engine_tls.engine
 
@@ -215,8 +216,16 @@ def read_plate(crop: np.ndarray) -> str:
     try:
         engine  = _get_ocr_engine()
         results = engine.ocr(crop, cls=False)
-        raw     = "".join(line[1][0] for line in results[0]) if results and results[0] else ""
-    except Exception:
+        # FIX: PaddleOCR >= 2.7 may return None instead of [] for empty results.
+        # Guard against both None and empty list before indexing.
+        raw = ""
+        if results and results[0]:
+            raw = "".join(
+                line[1][0] for line in results[0]
+                if line and len(line) > 1 and line[1]
+            )
+    except Exception as e:
+        print(f"  [OCR ERROR] {e}")
         raw = ""
 
     cleaned = "".join(c for c in raw if c.isalnum()).upper()
@@ -304,12 +313,15 @@ def push_to_supabase(vehicles: dict) -> dict:
             "timestamp": now_ist.isoformat(),
         }
 
-    remaining = [f for f in os.listdir(PLATES_DIR) if f.endswith(".jpg")]
-    if not remaining:
-        try:
-            os.rmdir(PLATES_DIR)
-        except OSError:
-            pass
+    # FIX: shutil.rmtree is safe even if dir has leftover files;
+    # os.rmdir raises OSError on non-empty dirs even with try/except in 3.12
+    # due to stricter OSError propagation semantics.
+    try:
+        remaining = [f for f in os.listdir(PLATES_DIR) if f.endswith(".jpg")]
+        if not remaining:
+            shutil.rmtree(PLATES_DIR, ignore_errors=True)
+    except OSError:
+        pass
 
     pushed = len(results)
     print(f"[AEGIS] Push complete: {pushed}/{total} succeeded"
@@ -322,10 +334,6 @@ def push_to_supabase(vehicles: dict) -> dict:
 # ──────────────────────────────────────────────
 
 def _reader_thread(cap: FastCapture, frame_q: queue.Queue):
-    """
-    Forwards every decoded frame to the GPU worker.
-    FRAME_SKIP=0 means no skipping — GPU processes all frames.
-    """
     frame_no = 0
     while True:
         ret, frame = cap.read()
@@ -339,23 +347,16 @@ def _reader_thread(cap: FastCapture, frame_q: queue.Queue):
     frame_q.put(_SENTINEL)
 
 
-def _gpu_worker(model_path: str, frame_q: queue.Queue, ocr_q: queue.Queue):
-    """
-    Batched YOLO inference with FP16 on RTX 3050.
-
-    KEY CHANGE vs old code:
-    - Always emits helmet_off_boxes + plate_boxes + rider_boxes separately.
-    - Does NOT require both to be present in the same frame.
-    - Collector handles cross-frame correlation via two-stage tracker.
-    """
+def _gpu_worker(model_path: str, frame_q: queue.Queue, ocr_q: queue.Queue, use_fp16: bool):
+    # FIX: Accept use_fp16 as a parameter instead of reading the global.
+    # Python 3.12 optimizes module globals more aggressively, so mutations
+    # via globals() from other threads are not reliably visible here.
     model = YOLO(model_path)
 
-    # ── CUDA 12 + FP16 setup ──────────────────────────────────────────────
     if _GPU_AVAILABLE:
         model.to("cuda")
-        
         print(f"[GPU]  Running on: {torch.cuda.get_device_name(0)}  |  "
-              f"FP16: {USE_FP16}  |  Batch: {INFERENCE_BATCH}")
+              f"FP16: {use_fp16}  |  Batch: {INFERENCE_BATCH}")
     else:
         print("[GPU]  ⚠️  No CUDA device — running on CPU")
 
@@ -372,7 +373,7 @@ def _gpu_worker(model_path: str, frame_q: queue.Queue, ocr_q: queue.Queue):
         sx = w_orig / INFER_IMG_SIZE
         sy = h_orig / INFER_IMG_SIZE
 
-        all_results = model(resized, verbose=False, half=USE_FP16)
+        all_results = model(resized, verbose=False, half=use_fp16)
 
         for (frame_no, orig_frame), result in zip(batch, all_results):
             helmet_off_boxes, plate_boxes, rider_boxes = [], [], []
@@ -392,9 +393,6 @@ def _gpu_worker(model_path: str, frame_q: queue.Queue, ocr_q: queue.Queue):
                 elif label == "rider":
                     rider_boxes.append((x1, y1, x2, y2, conf))
 
-            # ── CHANGED: always emit all detections, even if only one type ──
-            # Old code dropped the frame if both were not present together.
-            # Now collector correlates across frames via two-stage tracker.
             ocr_q.put({
                 "frame_no":         frame_no,
                 "helmet_off_boxes": helmet_off_boxes,
@@ -409,6 +407,7 @@ def _gpu_worker(model_path: str, frame_q: queue.Queue, ocr_q: queue.Queue):
         except queue.Empty:
             continue
 
+        # FIX: Compare against the sentinel object identity, not None.
         if item is _SENTINEL:
             done = True
         else:
@@ -423,19 +422,15 @@ def _gpu_worker(model_path: str, frame_q: queue.Queue, ocr_q: queue.Queue):
 
 
 def _ocr_worker(ocr_q: queue.Queue, result_q: queue.Queue):
-    """
-    Runs PaddleOCR on plate crops from frames that have plate detections.
-    Only crops matching a known pending violator are OCR'd — saves time.
-    """
     while True:
         item = ocr_q.get()
+        # FIX: sentinel identity check (not None check)
         if item is _SENTINEL:
             result_q.put(_SENTINEL)
             break
 
         plate_boxes = item["plate_boxes"]
 
-        # OCR every plate crop detected in this frame
         ocr_results = []
         for (px1, py1, px2, py2, pconf) in plate_boxes:
             crop = item["frame"][py1:py2, px1:px2]
@@ -451,7 +446,7 @@ def _ocr_worker(ocr_q: queue.Queue, result_q: queue.Queue):
             "frame_no":         item["frame_no"],
             "helmet_off_boxes": item["helmet_off_boxes"],
             "rider_boxes":      item["rider_boxes"],
-            "plate_results":    ocr_results,   # list, may be empty
+            "plate_results":    ocr_results,
             "frame":            item["frame"],
         })
 
@@ -460,22 +455,7 @@ def _ocr_worker(ocr_q: queue.Queue, result_q: queue.Queue):
 # TWO-STAGE COLLECTOR
 # ──────────────────────────────────────────────
 def _collector(result_q: queue.Queue, fps: float, total_frames: int, t_start: float):
-    """
-    Stage 1 — pending_violators:
-        Rider with confirmed helmet-off, waiting for a valid plate read.
-        Keyed by rider_box (tuple). Expires after PENDING_TTL_FRAMES.
-
-    Stage 2 — vehicles (confirmed violations):
-        Has both helmet-off confirmation AND a valid plate read.
-        Keeps the highest-confidence plate read seen so far.
-
-    This decouples helmet detection from plate detection across frames,
-    fixing the core issue where both had to appear in the same frame.
-    """
-    # pending: rider_box → {first_frame, last_frame, best_plate_conf, ...}
     pending_violators: dict = {}
-
-    # confirmed violations
     vehicles: dict  = {}
 
     noise_count    = 0
@@ -485,6 +465,7 @@ def _collector(result_q: queue.Queue, fps: float, total_frames: int, t_start: fl
     while sentinels_seen < OCR_WORKERS:
         item = result_q.get()
 
+        # FIX: sentinel identity check
         if item is _SENTINEL:
             sentinels_seen += 1
             continue
@@ -500,7 +481,6 @@ def _collector(result_q: queue.Queue, fps: float, total_frames: int, t_start: fl
         if frame_no % 60 == 0:
             _progress(frame_no, total_frames, t_start, len(vehicles), len(pending_violators))
 
-        # ── Expire stale pending riders ────────────────────────────────────
         stale = [
             rb for rb, data in pending_violators.items()
             if frame_no - data["last_seen_frame"] > PENDING_TTL_FRAMES
@@ -509,12 +489,10 @@ def _collector(result_q: queue.Queue, fps: float, total_frames: int, t_start: fl
             print(f"  ⏰ EXPIRED | Rider @ {rb} — no plate found within TTL")
             del pending_violators[rb]
 
-        # ── STAGE 1: Register new helmet-off riders into pending ───────────
         for (hx1, hy1, hx2, hy2, hconf) in helmet_off_boxes:
             ho_box = (hx1, hy1, hx2, hy2)
 
-            # Find which rider box this helmet-off belongs to
-            rider_box = ho_box   # fallback: use helmet-off box itself
+            rider_box = ho_box
             best_r_iou = 0.25
             for (rx1, ry1, rx2, ry2, _) in rider_boxes:
                 ov = iou(ho_box, (rx1, ry1, rx2, ry2))
@@ -522,10 +500,8 @@ def _collector(result_q: queue.Queue, fps: float, total_frames: int, t_start: fl
                     best_r_iou = ov
                     rider_box  = (rx1, ry1, rx2, ry2)
 
-            # Check if already tracking this rider in pending
             matched_pending = find_overlapping_box(rider_box, pending_violators, threshold=0.35)
 
-            # Check if already a confirmed violation for this rider
             already_confirmed = False
             for v in vehicles.values():
                 if iou(rider_box, v.get("rider_box", (0,0,0,0))) > 0.35:
@@ -536,7 +512,6 @@ def _collector(result_q: queue.Queue, fps: float, total_frames: int, t_start: fl
                 continue
 
             if matched_pending is None:
-                # New violator — add to pending
                 pending_violators[rider_box] = {
                     "first_frame":    frame_no,
                     "last_seen_frame": frame_no,
@@ -548,16 +523,13 @@ def _collector(result_q: queue.Queue, fps: float, total_frames: int, t_start: fl
                 }
                 print(f"  🔍 PENDING  | Frame {frame_no:>5} | New helmet-off rider detected @ {rider_box}")
             else:
-                # Update last seen
                 pending_violators[matched_pending]["last_seen_frame"] = frame_no
 
-        # ── STAGE 2: Match plate detections to pending riders ─────────────
         for plate_data in plate_results:
             px1, py1, px2, py2 = plate_data["box"]
             pconf              = plate_data["conf"]
             plate_text_raw     = plate_data["plate_text"]
             plate_crop         = plate_data["plate_crop"]
-            plate_box          = (px1, py1, px2, py2)
 
             if not is_valid_plate(plate_text_raw):
                 noise_count += 1
@@ -567,22 +539,17 @@ def _collector(result_q: queue.Queue, fps: float, total_frames: int, t_start: fl
 
             plate_text = plate_text_raw.strip().upper()
 
-            # Find which pending rider this plate belongs to
-            # Strategy: plate box should be near/below a pending rider box
             best_pending_key  = None
             best_pending_score = 0.0
 
             for rb, data in pending_violators.items():
                 rx1, ry1, rx2, ry2 = rb
-                # Plate is typically below the rider torso
-                # Score = vertical proximity + horizontal overlap
                 horiz_overlap = max(0, min(px2, rx2) - max(px1, rx1))
                 rider_width   = max(1, rx2 - rx1)
                 horiz_score   = horiz_overlap / rider_width
 
-                # Plate should be within 2× rider height below rider box
                 rider_height  = max(1, ry2 - ry1)
-                vert_dist     = py1 - ry2   # positive = plate is below rider
+                vert_dist     = py1 - ry2
                 vert_score    = 1.0 if 0 <= vert_dist <= rider_height * 2 else (
                                 0.5 if -rider_height <= vert_dist < 0 else 0.0
                 )
@@ -593,12 +560,10 @@ def _collector(result_q: queue.Queue, fps: float, total_frames: int, t_start: fl
                     best_pending_key   = rb
 
             if best_pending_key is None:
-                # Plate visible but no pending rider nearby — skip
                 continue
 
             pending = pending_violators[best_pending_key]
 
-            # Update pending with better plate read
             if pconf > pending["best_plate_conf"]:
                 pending["best_plate_conf"] = pconf
                 pending["best_plate_text"] = plate_text
@@ -608,7 +573,6 @@ def _collector(result_q: queue.Queue, fps: float, total_frames: int, t_start: fl
                 print(f"  📋 PLATE   | Frame {frame_no:>5} | Pending rider → '{plate_text}' "
                       f"conf: {pconf:.2%}")
 
-            # ── Promote to confirmed if plate conf crosses threshold ───────
             if pending["best_plate_conf"] >= PLATE_CONF_MIN:
                 pt   = pending["best_plate_text"]
                 pc   = pending["best_plate_conf"]
@@ -618,7 +582,6 @@ def _collector(result_q: queue.Queue, fps: float, total_frames: int, t_start: fl
                 match_key = find_matching_vehicle(pt, vehicles)
 
                 if match_key is None:
-                    # Brand new confirmed violation
                     img_path   = os.path.join(PLATES_DIR, f"plate_{pt}.jpg")
                     frame_path = os.path.join(PLATES_DIR, f"frame_{pt}.jpg")
                     cv2.imwrite(img_path, crop)
@@ -633,14 +596,12 @@ def _collector(result_q: queue.Queue, fps: float, total_frames: int, t_start: fl
                         "frame_image":   frame_path,
                         "rider_box":     best_pending_key,
                     }
-                    # Remove from pending — now confirmed
                     del pending_violators[best_pending_key]
 
                     print(f"  🚨 CONFIRMED | Frame {frame_no:>5} ({frame_no/fps:.1f}s) | "
                           f"Plate: {pt:<12} | Conf: {pc:.2%} | 💾 Saved")
 
                 else:
-                    # Already confirmed — upgrade if better conf
                     existing = vehicles[match_key]
                     if pc > existing["plate_conf"]:
                         old_conf      = existing["plate_conf"]
@@ -674,11 +635,9 @@ def _collector(result_q: queue.Queue, fps: float, total_frames: int, t_start: fl
                         print(f"  ⬆️  UPGRADE  | Frame {frame_no:>5} ({frame_no/fps:.1f}s) | "
                               f"Plate: {pt:<12} | {old_conf:.2%} → {pc:.2%}{tag}")
 
-                    # Remove from pending regardless
                     if best_pending_key in pending_violators:
                         del pending_violators[best_pending_key]
 
-    # ── End: report any riders still in pending (no plate ever found) ──────
     if pending_violators:
         print(f"\n[AEGIS] ⚠️  {len(pending_violators)} rider(s) had helmet-off "
               f"but no valid plate was found:")
@@ -699,27 +658,32 @@ def run():
         if f.endswith(".jpg"):
             os.remove(os.path.join(PLATES_DIR, f))
 
-    # ── CUDA 12 validation ────────────────────────────────────────────────
+    # FIX: use a local variable for fp16 decision; do NOT mutate the global
+    # via globals() — unreliable in Python 3.12 across threads.
+    use_fp16 = USE_FP16
+
     if _GPU_AVAILABLE:
-        cuda_ver = torch.version.cuda
+        # FIX: torch.version.cuda can be None on CPU-only torch builds.
+        # Always guard it before string formatting.
+        cuda_ver = torch.version.cuda or "unknown"
         gpu_name = torch.cuda.get_device_name(0)
         vram_gb  = torch.cuda.get_device_properties(0).total_memory / 1e9
         print(f"[AEGIS] ✅ GPU : {gpu_name}")
         print(f"[AEGIS]    CUDA: {cuda_ver}  |  VRAM: {vram_gb:.1f} GB")
-        if USE_FP16:
-            # Sanity-check FP16 before starting pipeline
+        if use_fp16:
             try:
                 _test = torch.zeros(1, device="cuda", dtype=torch.float16)
+                del _test
                 print(f"[AEGIS]    FP16: ✅ verified")
             except Exception as e:
                 print(f"[AEGIS]    FP16: ❌ {e} — falling back to FP32")
-                globals()["USE_FP16"] = False
+                use_fp16 = False
     else:
         print("[AEGIS] ⚠️  No CUDA GPU found — running on CPU (slow)")
 
     print(f"[AEGIS] ⚡ TURBO MODE")
     print(f"[AEGIS] Model          : {MODEL_PATH}")
-    print(f"[AEGIS] FP16           : {USE_FP16}")
+    print(f"[AEGIS] FP16           : {use_fp16}")
     print(f"[AEGIS] Infer batch    : {INFERENCE_BATCH}  @  {INFER_IMG_SIZE}px")
     print(f"[AEGIS] OCR engine     : PaddleOCR (GPU={_GPU_AVAILABLE})  ×{OCR_WORKERS} workers")
     print(f"[AEGIS] Frame skip     : {FRAME_SKIP} ({'every frame' if FRAME_SKIP == 0 else f'every {FRAME_SKIP+1}th frame'})")
@@ -750,8 +714,9 @@ def run():
     )
     reader.start()
 
+    # FIX: pass use_fp16 explicitly so the GPU thread doesn't need to read globals
     gpu_thread = threading.Thread(
-        target=_gpu_worker, args=(MODEL_PATH, frame_q, ocr_q),
+        target=_gpu_worker, args=(MODEL_PATH, frame_q, ocr_q, use_fp16),
         daemon=True, name="GPU",
     )
     gpu_thread.start()
@@ -766,7 +731,6 @@ def run():
     for t in ocr_threads:
         t.start()
 
-    # Collector runs in main thread — no locks needed for vehicles/pending dicts
     vehicles, noise_count, frame_no = _collector(result_q, fps, total_frames, t_start)
 
     reader.join()
@@ -779,7 +743,6 @@ def run():
     print(f"\n[AEGIS] ✅ Done in {elapsed:.1f}s  |  {len(vehicles)} violation(s)  |  "
           f"OCR cache size: {len(_ocr_cache)}")
 
-    # ── PHASE 2 — Supabase push ───────────────────────────────────────────
     supabase_results = push_to_supabase(vehicles)
 
     final = sorted(vehicles.values(), key=lambda r: r["frame"])
@@ -790,7 +753,6 @@ def run():
         rec["frame_url"]       = sb.get("frame_url", "")
         rec["supabase_row_id"] = sb.get("row_id", "")
         rec["pushed_at"]       = sb.get("timestamp", "")
-        # Remove internal key before saving to JSON
         rec.pop("rider_box", None)
 
     report = {
